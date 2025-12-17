@@ -3,12 +3,13 @@ use crate::{
     exchange::{order::OrderRequest, BuilderInfo},
     helpers::next_nonce,
     prelude::*,
-    signature::{sign_l1_action,sign_typed_data},
-    BulkOrder,SpotSend, Error,
+    signature::{sign_l1_action, sign_typed_data},
+    BulkOrder, Error, SendAsset, SpotSend,
 };
 use alloy::primitives::{keccak256, Address, Signature, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
+use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -37,6 +38,7 @@ pub(crate) struct OrderRestingDetails {
 pub(crate) enum Actions {
     Order(BulkOrder),
     SpotSend(SpotSend),
+    SendAsset(SendAsset),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,37 +154,73 @@ pub async fn bulk_order_with_builder(
     return Ok(payload);
 }
 
- pub async fn spot_transfer(
-        amount: &str,
-        destination: &str,
-        token: &str,
-        wallet: PrivateKeySigner,
-        nonce: u64,
-    ) -> Result<serde_json::Value> {
+pub async fn spot_transfer(
+    amount: &str,
+    destination: &str,
+    token: &str,
+    wallet: PrivateKeySigner,
+    nonce: u64,
+) -> Result<serde_json::Value> {
+    let spot_send = SpotSend {
+        signature_chain_id: 421614,
+        hyperliquid_chain: "Mainnet".to_string(),
+        destination: destination.to_string(),
+        amount: amount.to_string(),
+        time: nonce,
+        token: token.to_string(),
+    };
+    let signature = sign_typed_data(&spot_send, &wallet)?;
+    let action = serde_json::to_value(Actions::SpotSend(spot_send))
+        .map_err(|e| Error::JsonParse(e.to_string()))?;
 
-        let spot_send = SpotSend {
-            signature_chain_id: 421614,
-            hyperliquid_chain: "Mainnet".to_string(),
-            destination: destination.to_string(),
-            amount: amount.to_string(),
-            time: nonce,
-            token: token.to_string(),
-        };
-        let signature = sign_typed_data(&spot_send, &wallet)?;
-        let action = serde_json::to_value(Actions::SpotSend(spot_send))
-            .map_err(|e| Error::JsonParse(e.to_string()))?;
-        
-        let exchange_payload = ExchangePayload {
-            action: action,
-            signature: signature.into(),
-            nonce: nonce,
-            vault_address: None,
-        };
-         let payload = serde_json::to_value(&exchange_payload).map_err(|e| Error::JsonParse(e.to_string()))?;
-            return Ok(payload);
-    }
+    let exchange_payload = ExchangePayload {
+        action: action,
+        signature: signature.into(),
+        nonce: nonce,
+        vault_address: None,
+    };
+    let payload =
+        serde_json::to_value(&exchange_payload).map_err(|e| Error::JsonParse(e.to_string()))?;
+    return Ok(payload);
+}
 
+pub async fn send_asset(
+    amount: &str,
+    destination: &str,
+    token: &str,
+    source_dex: &str,
+    destination_dex: &str,
+    from_sub_account: &str,
+    wallet: PrivateKeySigner,
+    nonce: u64,
+) -> Result<serde_json::Value> {
+    let send_asset = SendAsset {
+        signature_chain_id: 0x3e7,
+        hyperliquid_chain: "Mainnet".to_string(),
+        destination: destination.to_string(),
+        source_dex: source_dex.to_string(),
+        destination_dex: destination_dex.to_string(),
+        token: token.to_string(),
+        amount: amount.to_string(),
+        from_sub_account: from_sub_account.to_string(),
+        nonce,
+    };
 
+    let signature = sign_typed_data(&send_asset, &wallet)?;
+    let action = serde_json::to_value(Actions::SendAsset(send_asset))
+        .map_err(|e| Error::JsonParse(e.to_string()))?;
+
+    let vault_address = None;
+    let exchange_payload = ExchangePayload {
+        action,
+        signature: signature.into(),
+        nonce,
+        vault_address,
+    };
+    let payload =
+        serde_json::to_value(&exchange_payload).map_err(|e| Error::JsonParse(e.to_string()))?;
+    return Ok(payload);
+}
 
 #[cfg(test)]
 mod tests {
@@ -247,7 +285,8 @@ mod tests {
         }
     }
 
-     async fn test_spot_transfer() {
+    #[tokio::test]
+    async fn test_spot_transfer() {
         let nonce = next_nonce();
         let _ = env_logger::builder()
             .is_test(true)
@@ -291,4 +330,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_send_asset() {
+        let nonce = next_nonce();
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Info)
+            .try_init();
+
+        let ws_url = "wss://api.hyperliquid.xyz/ws";
+
+        let private_key = "";
+        let wallet = PrivateKeySigner::from_str(private_key).expect("Invalid private key");
+
+        println!("Creating WsManager...");
+        let mut ws_manager = WsManager::new(ws_url.to_string(), true)
+            .await
+            .expect("Failed to create WsManager");
+
+        println!("Waiting for WebSocket connection to stabilize...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let amount = "1";
+        let destination = "0x2aE061eFF7dDCC024C7d75359E3F2b5634e18d43";
+        let token = "USDT0:0x25faedc3f054130dbb4e4203aca63567";
+        let source_dex = "spot";
+        let destination_dex = "spot";
+        let from_sub_account = "0xe3fed721adf2ab9bf0674b4a9178e3f3d4e9b233";
+
+        println!("Sending asset...");
+        let payload = send_asset(
+            amount,
+            destination,
+            token,
+            source_dex,
+            destination_dex,
+            from_sub_account,
+            wallet,
+            nonce,
+        )
+        .await
+        .unwrap();
+
+        let result = ws_manager.post(payload, nonce).await;
+        println!("Result: {:#?}", result);
+        match result {
+            Ok(response) => {
+                println!(
+                    "Full Response: {}",
+                    serde_json::to_string_pretty(&response).unwrap()
+                );
+            }
+            Err(e) => {
+                eprintln!("Error sending asset: {:?}", e);
+            }
+        }
+    }
 }
